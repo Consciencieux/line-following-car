@@ -31,10 +31,15 @@ static const bool LED_ACTIVE_LOW = true;
 //    手指贴住探头会反射红外，输出为低，所以和黑纸的转弯方向相反。
 static const bool TRACK_BLACK_IS_HIGH = true;
 
-// 2) 速度，0~255。先架起来试，再落地；落地后从 120 左右往上加。
+// 2) 速度，0~255。先架起来试，再落地；落地后从低速开始调。
 static const int BASE_SPEED = 50;  // 直行
 static const int TURN_OUTER = 100;  // 转弯时外侧轮
 static const int TURN_INNER = 10;  // 转弯时内侧轮，越小转得越急
+
+// 同一侧持续压黑才切换到急弯。单位为 ms，需用实车的缓弧和急弯校准。
+static const uint32_t CORNER_TRIGGER_MS = 60;
+static const int CORNER_INNER = 0;  // 内轮刹停；半径仍大时可试小幅反转
+static const uint32_t CORNER_TIMEOUT_MS = 1200;  // 从锁定方向开始计时
 
 // 3) 加减速斜率：每个控制周期最多变化多少。太小则反应慢，太大则
 //    起步顿挫、轮胎打滑。
@@ -57,13 +62,14 @@ static const uint32_t ARM_DELAY_MS = 1000;
 //
 //   LO 黑、RO 白  ->  线在左边  ->  左轮慢、右轮快（向左修）
 //   LO 白、RO 黑  ->  线在右边  ->  左轮快、右轮慢（向右修）
-//   两个都黑（十字路口、宽线）或两个都白（正常骑跨）-> 直行
+//   普通循迹时，两个都黑（十字路口、宽线）或两个都白（正常骑跨）-> 直行
 //
 // 如果实测发现车越修越偏，把 TRACK_LO / TRACK_RO 两个常量对调即可。
 // 如果整个车前进变成后退，对调某一侧的两个 IN 常量。
 
 enum TrackState : uint8_t {
-  TRACK_STRAIGHT,
+  TRACK_BOTH_WHITE,
+  TRACK_BOTH_BLACK,
   TRACK_TURN_LEFT,
   TRACK_TURN_RIGHT,
 };
@@ -127,41 +133,75 @@ static TrackState sampleTrack() {
   const bool left = seesBlack(TRACK_LO);
   const bool right = seesBlack(TRACK_RO);
   if (left == right) {
-    return TRACK_STRAIGHT;
+    return left ? TRACK_BOTH_BLACK : TRACK_BOTH_WHITE;
   }
   return left ? TRACK_TURN_LEFT : TRACK_TURN_RIGHT;
 }
 
-static TrackState trackState = TRACK_STRAIGHT;
+static TrackState trackState = TRACK_BOTH_WHITE;
+static TrackState candidate = TRACK_BOTH_WHITE;
 static uint8_t trackSamples = 0;
+static uint32_t trackSince = 0;
 
-// 去抖后的状态：新结果要连续出现 DEBOUNCE_SAMPLES 次才生效。
-static TrackState readTrack() {
+// 只统计连续相同的候选读数。记录确认变化的时刻，供急弯判定使用。
+static void readTrack(uint32_t now) {
   const TrackState raw = sampleTrack();
-  if (raw == trackState) {
+  if (raw != candidate) {
+    candidate = raw;
     trackSamples = 0;
-    return trackState;
   }
-  if (++trackSamples >= DEBOUNCE_SAMPLES) {
+  if (raw != trackState && ++trackSamples >= DEBOUNCE_SAMPLES) {
     trackState = raw;
-    trackSamples = 0;
+    trackSince = now;
   }
-  return trackState;
 }
 
-static void trackTargets(TrackState state, int &left, int &right) {
-  switch (state) {
+enum CornerPhase : uint8_t { FOLLOW, WAIT_FOR_WHITE, SEEK_LINE, STOPPED };
+static CornerPhase phase = FOLLOW;
+static TrackState cornerSide = TRACK_BOTH_WHITE;
+static uint32_t cornerSince = 0;
+
+static void trackTargets(uint32_t now, int &left, int &right) {
+  const bool singleBlack = trackState == TRACK_TURN_LEFT || trackState == TRACK_TURN_RIGHT;
+  if (phase == FOLLOW) {
+    // 重捕黑线后，同一次压线只做普通修正，直到探头状态再次改变。
+    if (trackState != cornerSide) {
+      cornerSide = TRACK_BOTH_WHITE;
+    }
+    if (singleBlack && trackState != cornerSide && now - trackSince >= CORNER_TRIGGER_MS) {
+      cornerSide = trackState;
+      cornerSince = now;
+      phase = WAIT_FOR_WHITE;
+    }
+  } else if (phase != STOPPED) {
+    if (now - cornerSince >= CORNER_TIMEOUT_MS) {
+      phase = STOPPED;
+    } else if (phase == WAIT_FOR_WHITE && trackState == TRACK_BOTH_WHITE) {
+      phase = SEEK_LINE;
+    } else if (phase == SEEK_LINE && singleBlack) {
+      phase = FOLLOW;
+      cornerSide = trackState;
+    }
+  }
+
+  if (phase == STOPPED) {
+    left = right = 0;
+    return;
+  }
+  const bool pivot = phase != FOLLOW;
+  const TrackState direction = pivot ? cornerSide : trackState;
+  const int inner = pivot ? CORNER_INNER : TURN_INNER;
+  switch (direction) {
     case TRACK_TURN_LEFT:
-      left = TURN_INNER;
+      left = inner;
       right = TURN_OUTER;
       break;
     case TRACK_TURN_RIGHT:
       left = TURN_OUTER;
-      right = TURN_INNER;
+      right = inner;
       break;
     default:
-      left = BASE_SPEED;
-      right = BASE_SPEED;
+      left = right = BASE_SPEED;
       break;
   }
 }
@@ -183,7 +223,7 @@ static const char *stateName(TrackState state) {
     case TRACK_TURN_RIGHT:
       return "right";
     default:
-      return "straight";
+      return state == TRACK_BOTH_BLACK ? "both-black" : "both-white";
   }
 }
 
@@ -191,7 +231,8 @@ static void printTrack(uint32_t now) {
   const bool leftBlack = seesBlack(TRACK_LO);
   const bool rightBlack = seesBlack(TRACK_RO);
 
-  Serial.print("raw LO=");
+  Serial.print(now);
+  Serial.print(" ms  raw LO=");
   Serial.print(digitalRead(TRACK_LO) == HIGH ? 1 : 0);
   Serial.print(" RO=");
   Serial.print(digitalRead(TRACK_RO) == HIGH ? 1 : 0);
@@ -200,8 +241,14 @@ static void printTrack(uint32_t now) {
   Serial.print(" RO=");
   Serial.print(rightBlack ? 1 : 0);
   Serial.print("  -> ");
-  Serial.println(stateName(readTrack()));
-  (void)now;
+  Serial.print(stateName(trackState));
+  Serial.print("  ");
+  switch (phase) {
+    case FOLLOW: Serial.println("follow"); break;
+    case WAIT_FOR_WHITE: Serial.println("corner: leaving line"); break;
+    case SEEK_LINE: Serial.println("corner: seeking line"); break;
+    case STOPPED: Serial.println("corner: timeout"); break;
+  }
 }
 #endif
 
@@ -244,26 +291,34 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-#if TRACK_DEBUG
-  static uint32_t lastPrint = 0;
-  if ((uint32_t)(now - lastPrint) >= 100) {
-    lastPrint = now;
-    printTrack(now);
-  }
-#else
+#if !TRACK_DEBUG
   updateLed(now);
-
+#endif
   if ((uint32_t)(now - lastTick) < PERIOD_MS) {
     return;
   }
   lastTick = now;
 
-  const TrackState state = readTrack();
-
+#if TRACK_DEBUG
+  const TrackState previousTrack = trackState;
+  const CornerPhase previousPhase = phase;
+#endif
+  readTrack(now);
   int targetLeft = 0;
   int targetRight = 0;
-  trackTargets(state, targetLeft, targetRight);
+  trackTargets(now, targetLeft, targetRight);
 
+#if TRACK_DEBUG
+  static uint32_t lastPrint = 0;
+  if (previousTrack != trackState || previousPhase != phase || now - lastPrint >= 100) {
+    printTrack(now);
+    lastPrint = now;
+  }
+#else
+  if (phase == STOPPED) {
+    drive(0, 0);
+    return;
+  }
   currentLeft = approach(currentLeft, targetLeft, RAMP_STEP);
   currentRight = approach(currentRight, targetRight, RAMP_STEP);
   drive(currentLeft, currentRight);
