@@ -27,14 +27,14 @@ static const bool LED_ACTIVE_LOW = true;
 // ========================== 需要现场调的参数 ==========================
 
 // 1) 探头极性：探头压在黑线上时，数字输出是高电平还是低电平。
-//    不同厂家的模块不一样。先把 TRACK_DEBUG 改成 1 烧进去，打开串口，
-//    把探头放到黑线上看打印里 black 那一栏是不是 1，不是就改这里。
-static const bool TRACK_BLACK_IS_HIGH = false;
+//    这个模块看的是红外反射，不是颜色本身。黑纸几乎不反射，输出为高；
+//    手指贴住探头会反射红外，输出为低，所以和黑纸的转弯方向相反。
+static const bool TRACK_BLACK_IS_HIGH = true;
 
 // 2) 速度，0~255。先架起来试，再落地；落地后从 120 左右往上加。
-static const int BASE_SPEED = 150;  // 直行
-static const int TURN_OUTER = 210;  // 转弯时外侧轮
-static const int TURN_INNER = 40;   // 转弯时内侧轮，越小转得越急
+static const int BASE_SPEED = 50;  // 直行
+static const int TURN_OUTER = 100;  // 转弯时外侧轮
+static const int TURN_INNER = 10;  // 转弯时内侧轮，越小转得越急
 
 // 3) 加减速斜率：每个控制周期最多变化多少。太小则反应慢，太大则
 //    起步顿挫、轮胎打滑。
